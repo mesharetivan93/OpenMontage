@@ -636,3 +636,61 @@ def test_fal_single_url_maps_to_gpt_references():
         {"prompt": "Blue sky", "image_url": "https://example.com/image.png"}
     )[3]
     assert payload["image_urls"] == ["https://example.com/image.png"]
+
+
+def test_gemini_tts_falls_back_to_generate_content(monkeypatch, tmp_path):
+    """Interactions 404s on some API keys; generateContent must produce a WAV."""
+    import base64
+    import wave
+    import tools.google_credentials as creds
+    import tools.provider_jobs as jobs
+
+    class Interactions:
+        def create(self, **request):
+            raise RuntimeError("404 model not found")
+
+    class Client:
+        interactions = Interactions()
+
+    pcm = b"\x00\x01" * 2400
+    seen = {}
+
+    def fake_request(method, url, **kwargs):
+        seen["url"] = url
+        seen["body"] = kwargs["json"]
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "audio/L16;codec=pcm;rate=24000",
+                                    "data": base64.b64encode(pcm).decode(),
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test")
+    monkeypatch.setattr(creds, "get_genai_client", lambda **_: Client())
+    monkeypatch.setattr(jobs, "request_json", fake_request)
+    out = tmp_path / "speech.wav"
+    result = GeminiTTS().execute(
+        {"text": "Hola", "style": "warmly", "voice_id": "Puck", "output_path": str(out)}
+    )
+    assert result.success, result.error
+    assert result.data["route"] == "generateContent"
+    assert seen["url"].endswith("/models/gemini-3.8-flash-tts:generateContent")
+    assert seen["body"]["contents"][0]["parts"][0]["text"] == "warmly: Hola"
+    assert (
+        seen["body"]["generationConfig"]["speechConfig"]["voiceConfig"][
+            "prebuiltVoiceConfig"
+        ]["voiceName"]
+        == "Puck"
+    )
+    with wave.open(str(out)) as wav:
+        assert wav.getframerate() == 24000 and wav.getnframes() == 2400

@@ -135,6 +135,82 @@ class GeminiTTS(BaseTool):
             "generation_config": {"speech_config": speech},
         }
 
+    @staticmethod
+    def build_generate_content_request(inputs):
+        """Request body for the standard generateContent TTS route (API-key fallback)."""
+        if inputs.get("turns"):
+            lines = [
+                f"{t['speaker']} ({t['style']}): {t['text']}"
+                if t.get("style")
+                else f"{t['speaker']}: {t['text']}"
+                for t in inputs["turns"]
+            ]
+            text = "\n".join(lines)
+            speech = {
+                "multiSpeakerVoiceConfig": {
+                    "speakerVoiceConfigs": [
+                        {
+                            "speaker": s["speaker"],
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {"voiceName": s["voice"]}
+                            },
+                        }
+                        for s in inputs.get("speakers", [])
+                    ]
+                }
+            }
+        else:
+            style = inputs.get("style")
+            text = f"{style}: {inputs['text']}" if style else inputs["text"]
+            speech = {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": inputs.get("voice_id", "Kore")
+                    }
+                }
+            }
+        return {
+            "contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": speech,
+            },
+        }
+
+    def _generate_content_wav(self, inputs, model, api_key):
+        """Call models/{model}:generateContent and return WAV bytes."""
+        import io
+        import re
+        import wave
+
+        from tools.provider_jobs import request_json
+
+        body = request_json(
+            "POST",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=self.build_generate_content_request(inputs),
+        )
+        for candidate in body.get("candidates", []):
+            for part in (candidate.get("content") or {}).get("parts", []):
+                inline = part.get("inlineData") or part.get("inline_data")
+                if not inline or not inline.get("data"):
+                    continue
+                raw = base64.b64decode(inline["data"])
+                if raw[:4] == b"RIFF":
+                    return raw
+                mime = inline.get("mimeType") or inline.get("mime_type") or ""
+                rate_match = re.search(r"rate=(\d+)", mime)
+                rate = int(rate_match.group(1)) if rate_match else 24000
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wav:  # Gemini returns raw 16-bit mono PCM
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(rate)
+                    wav.writeframes(raw)
+                return buf.getvalue()
+        raise ValueError("generateContent returned no audio")
+
     def execute(self, inputs):
         try:
             if inputs.get("operation") == "list_voices":
@@ -161,28 +237,46 @@ class GeminiTTS(BaseTool):
 
             # Hold the client: a temporary one can be garbage-collected (closing
             # its HTTP session) before interactions.create sends the request.
-            client = get_genai_client()
-            result = client.interactions.create(**request)
-            audio = getattr(result, "output_audio", None)
-            if not audio or not getattr(audio, "data", None):
-                audio = next(
-                    (
-                        part
-                        for step in (getattr(result, "steps", None) or [])
-                        if getattr(step, "type", None) == "model_output"
-                        for part in (getattr(step, "content", None) or [])
-                        if getattr(part, "type", None) == "audio"
-                        and getattr(part, "data", None)
-                    ),
-                    None,
+            route = "interactions"
+            try:
+                client = get_genai_client()
+                result = client.interactions.create(**request)
+                audio = getattr(result, "output_audio", None)
+                if not audio or not getattr(audio, "data", None):
+                    audio = next(
+                        (
+                            part
+                            for step in (getattr(result, "steps", None) or [])
+                            if getattr(step, "type", None) == "model_output"
+                            for part in (getattr(step, "content", None) or [])
+                            if getattr(part, "type", None) == "audio"
+                            and getattr(part, "data", None)
+                        ),
+                        None,
+                    )
+                if not audio:
+                    raise ValueError("Gemini returned no audio")
+                data = (
+                    base64.b64decode(audio.data)
+                    if isinstance(audio.data, str)
+                    else audio.data
                 )
-            if not audio:
-                raise ValueError("Gemini returned no audio")
-            data = (
-                base64.b64decode(audio.data)
-                if isinstance(audio.data, str)
-                else audio.data
-            )
+            except Exception as interactions_error:
+                # Local patch: some Gemini Developer API keys get a 404 from the
+                # Interactions endpoint even though the same model works through
+                # the standard generateContent route. Fall back to it when an API
+                # key is available; otherwise surface the original error.
+                key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+                if not key:
+                    raise
+                try:
+                    data = self._generate_content_wav(inputs, request["model"], key)
+                except Exception as fallback_error:
+                    raise ValueError(
+                        f"Interactions route failed ({interactions_error}); "
+                        f"generateContent fallback failed ({fallback_error})"
+                    ) from fallback_error
+                route = "generateContent"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             return ToolResult(
@@ -192,6 +286,7 @@ class GeminiTTS(BaseTool):
                     "model": request["model"],
                     "output": str(path),
                     "format": "wav",
+                    "route": route,
                     "cost_status": "unquoted",
                 },
                 artifacts=[str(path)],
